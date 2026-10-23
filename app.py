@@ -1,5 +1,8 @@
-"""Standard-library todo server. All default storage is process-local."""
+"""Standard-library todo server. Todos persist in SQLite by default."""
 import argparse
+from contextlib import closing
+import os
+import sqlite3
 import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -44,13 +47,62 @@ class MemoryTodoStore:
             del self._todos[todo_id]
 
 
+class SQLiteTodoStore:
+    """File-backed store; each operation owns its connection and transaction."""
+
+    def __init__(self, path):
+        self.path = str(path)
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS todos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    completed INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1))
+                )
+            """)
+
+    @staticmethod
+    def _todo(row):
+        return dict(id=row[0], title=row[1], completed=bool(row[2]))
+
+    def list(self):
+        with closing(sqlite3.connect(self.path)) as connection:
+            return [self._todo(row) for row in connection.execute(
+                'SELECT id, title, completed FROM todos ORDER BY id')]
+
+    def create(self, title):
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            cursor = connection.execute('INSERT INTO todos (title) VALUES (?)', (title,))
+            return dict(id=cursor.lastrowid, title=title, completed=False)
+
+    def set_completed(self, todo_id, completed):
+        if not 1 <= todo_id <= 9223372036854775807:
+            raise KeyError(todo_id)
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            cursor = connection.execute(
+                'UPDATE todos SET completed = ? WHERE id = ?', (completed, todo_id))
+            if not cursor.rowcount:
+                raise KeyError(todo_id)
+            row = connection.execute(
+                'SELECT id, title, completed FROM todos WHERE id = ?', (todo_id,)).fetchone()
+            return self._todo(row)
+
+    def delete(self, todo_id):
+        if not 1 <= todo_id <= 9223372036854775807:
+            raise KeyError(todo_id)
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            cursor = connection.execute('DELETE FROM todos WHERE id = ?', (todo_id,))
+            if not cursor.rowcount:
+                raise KeyError(todo_id)
+
+
 STATIC = Path(__file__).parent / 'static'
 MAX_BODY = 16384
 
 
 def create_server(host='127.0.0.1', port=8080, store: TodoStore | None = None):
     """Return an unstarted server; caller owns serve_forever/server_close."""
-    todo_store = MemoryTodoStore() if store is None else store
+    todo_store = SQLiteTodoStore(os.environ.get('TODO_DB_PATH', 'todos.sqlite3')) if store is None else store
 
     class Handler(BaseHTTPRequestHandler):
         def send_body(self, status, body=b'', content_type='application/json; charset=utf-8'):

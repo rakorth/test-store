@@ -1,9 +1,15 @@
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import tempfile
+from unittest.mock import patch
+import os
+
 import http.client
 import json
 import threading
 import unittest
 
-from app import MemoryTodoStore, create_server
+from app import MemoryTodoStore, SQLiteTodoStore, create_server
 
 
 class StoreTests(unittest.TestCase):
@@ -31,9 +37,45 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(sorted(t['id'] for t in store.list()), list(range(1, 31)))
 
 
+class SQLiteStoreTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / 'test.sqlite3'
+
+    def test_restart_persists_create_update_delete_and_ids(self):
+        store = SQLiteTodoStore(self.path)
+        title = "Robert'); DROP TABLE todos; --"
+        first = store.create(title)
+        deleted = store.create('delete me')
+        fresh = SQLiteTodoStore(self.path)
+        self.assertEqual(fresh.list(), [first, deleted])
+        updated = fresh.set_completed(first['id'], True)
+        fresh.delete(deleted['id'])
+        restarted = SQLiteTodoStore(self.path)
+        self.assertEqual(restarted.list(), [updated])
+        self.assertEqual(updated, dict(id=first['id'], title=title, completed=True))
+        self.assertGreater(restarted.create('next')['id'], deleted['id'])
+        restarted.set_completed(first['id'], False)
+        self.assertIs(SQLiteTodoStore(self.path).list()[0]['completed'], False)
+        for operation in (restarted.delete, lambda key: restarted.set_completed(key, True)):
+            for key in (deleted['id'], 10 ** 100):
+                with self.assertRaises(KeyError):
+                    operation(key)
+
+    def test_concurrent_connections_commit_unique_records(self):
+        store = SQLiteTodoStore(self.path)
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            todos = list(executor.map(store.create, [f'todo {i}' for i in range(30)]))
+        self.assertEqual(len({todo['id'] for todo in todos}), 30)
+        self.assertEqual(SQLiteTodoStore(self.path).list(), sorted(todos, key=lambda t: t['id']))
+
+
 class HTTPTests(unittest.TestCase):
     def setUp(self):
-        self.store = MemoryTodoStore()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.store = SQLiteTodoStore(Path(directory.name) / "test.sqlite3")
         self.server = create_server('127.0.0.1', 0, self.store)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -132,6 +174,42 @@ class HTTPTests(unittest.TestCase):
         self.assertNotIn(b'innerHTML', script)
         self.assertNotIn(b'insertAdjacentHTML', script)
         self.assertEqual(self.request('GET')[1]['todos'][0]['title'], title)
+
+
+class RestartHTTPTests(unittest.TestCase):
+    request = HTTPTests.request
+    close_server = HTTPTests.close_server
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / 'http.sqlite3'
+        self.start_server()
+
+    def start_server(self):
+        with patch.dict(os.environ, TODO_DB_PATH=str(self.path)):
+            self.server = create_server('127.0.0.1', 0)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        server, thread = self.server, self.thread
+        def cleanup():
+            server.shutdown()
+            server.server_close()
+            thread.join()
+        self.addCleanup(cleanup)
+
+    def test_restart_default_app(self):
+        first = self.request('POST', data={'title': '  persistent  '})[1]['todo']
+        deleted = self.request('POST', data={'title': 'delete'})[1]['todo']
+        self.close_server()
+        self.start_server()
+        self.assertEqual(self.request('GET'), (200, {'todos': [first, deleted]}))
+        updated = self.request('PATCH', f"/api/todos/{first['id']}", {'completed': True})[1]['todo']
+        self.assertEqual(self.request('DELETE', f"/api/todos/{deleted['id']}")[0], 204)
+        self.close_server()
+        self.start_server()
+        self.assertEqual(self.request('GET'), (200, {'todos': [updated]}))
+        self.assertEqual(updated, dict(id=first['id'], title='persistent', completed=True))
+        self.assertGreater(self.request('POST', data={'title': 'next'})[1]['todo']['id'], deleted['id'])
 
 
 if __name__ == '__main__':
