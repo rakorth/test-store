@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Todos</title>
+<style>
+body { font: 1rem system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; background: #fafafa; color: #222; }
+form, li { display: flex; gap: .75rem; align-items: center; margin: .75rem 0; }
+input[type=text], .title { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+input, button { font: inherit; padding: .5rem; }
+ul { padding: 0; list-style: none; }
+.done { text-decoration: line-through; color: #666; }
+#error { color: #a00; }
+</style>
+<h1>Todos</h1>
+<p>Keep track of your tasks. Todos are cleared when the server restarts.</p>
+<form id="add-form">
+<label for="title">New todo</label>
+<input id="title" type="text" maxlength="200" required autocomplete="off">
+<button>Add</button>
+</form>
+<p id="error" role="alert"></p>
+<ul id="todos" aria-label="Todo list"></ul>
+<p id="empty" hidden>No todos yet.</p>
+<script src="/app.js" defer></script>
+</html>
