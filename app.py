@@ -12,9 +12,27 @@ from typing import Protocol
 from urllib.parse import urlsplit
 
 
+def validate_patch(data):
+    """Validate all recognized fields before returning normalized changes."""
+    changes = {}
+    if 'title' in data:
+        title = data['title']
+        if not isinstance(title, str) or not 1 <= len(title.strip()) <= 200:
+            raise ValueError('title must be a string of 1–200 characters after trimming')
+        changes['title'] = title.strip()
+    if 'completed' in data:
+        if type(data['completed']) is not bool:
+            raise ValueError('completed must be a boolean')
+        changes['completed'] = data['completed']
+    if not changes:
+        raise ValueError('PATCH must include title or completed')
+    return changes
+
+
 class TodoStore(Protocol):
     def list(self) -> list[dict]: ...
     def create(self, title: str) -> dict: ...
+    def update(self, todo_id: int, **changes) -> dict: ...
     def set_completed(self, todo_id: int, completed: bool) -> dict: ...
     def delete(self, todo_id: int) -> None: ...
 
@@ -36,11 +54,15 @@ class MemoryTodoStore:
             self._next_id += 1
             return todo.copy()
 
-    def set_completed(self, todo_id, completed):
+    def update(self, todo_id, **changes):
+        changes = validate_patch(changes)
         with self._lock:
             todo = self._todos[todo_id]
-            todo['completed'] = completed
+            todo.update(changes)
             return todo.copy()
+
+    def set_completed(self, todo_id, completed):
+        return self.update(todo_id, completed=completed)
 
     def delete(self, todo_id):
         with self._lock:
@@ -75,17 +97,24 @@ class SQLiteTodoStore:
             cursor = connection.execute('INSERT INTO todos (title) VALUES (?)', (title,))
             return dict(id=cursor.lastrowid, title=title, completed=False)
 
-    def set_completed(self, todo_id, completed):
+    def update(self, todo_id, **changes):
+        changes = validate_patch(changes)
         if not 1 <= todo_id <= 9223372036854775807:
             raise KeyError(todo_id)
+        # Column names come exclusively from validate_patch, never request text.
+        assignments = ', '.join(f'{name} = ?' for name in changes)
         with closing(sqlite3.connect(self.path)) as connection, connection:
             cursor = connection.execute(
-                'UPDATE todos SET completed = ? WHERE id = ?', (completed, todo_id))
+                f'UPDATE todos SET {assignments} WHERE id = ?',
+                (*changes.values(), todo_id))
             if not cursor.rowcount:
                 raise KeyError(todo_id)
             row = connection.execute(
                 'SELECT id, title, completed FROM todos WHERE id = ?', (todo_id,)).fetchone()
             return self._todo(row)
+
+    def set_completed(self, todo_id, completed):
+        return self.update(todo_id, completed=completed)
 
     def delete(self, todo_id):
         if not 1 <= todo_id <= 9223372036854775807:
@@ -156,10 +185,13 @@ def create_server(host='127.0.0.1', port=8080, store: TodoStore | None = None):
             if match and method in ('PATCH', 'DELETE'):
                 todo_id = int(match[1])
                 if method == 'PATCH':
-                    data = self.read_json()
-                    if type(data.get('completed')) is not bool:
-                        raise ValueError('completed must be a boolean')
-                    self.json_response(200, {'todo': todo_store.set_completed(todo_id, data['completed'])})
+                    changes = validate_patch(self.read_json())
+                    if 'title' in changes:
+                        todo = todo_store.update(todo_id, **changes)
+                    else:
+                        # Preserve compatibility with completion-only injected stores.
+                        todo = todo_store.set_completed(todo_id, changes['completed'])
+                    self.json_response(200, {'todo': todo})
                 else:
                     todo_store.delete(todo_id)
                     self.send_body(204)
